@@ -1,0 +1,20 @@
+# googlefind - Google Find Hub locations for the trackers of one account (GoogleFindMyTools).
+# Google is asked for fresh locations only on request (POST /api/devices/{id}/locate); the
+# answer arrives over FCM. In the background only the EIDs of custom (MCU) trackers are
+# re-uploaded every REFRESH_INTERVAL_H hours (Google forgets them after ~4 days).
+# ./data/secrets.json = Auth/secrets.json of GoogleFindMyTools after a desktop login.
+# API_TOKEN comes from ./.env (see .env.example); clients send it as "X-Api-Token"
+# or "Authorization: Bearer". Put it behind a reverse proxy with HTTPS for outside access.
+services:
+  googlefind:
+    build: .
+    image: googlefind:latest
+    container_name: googlefind
+    restart: always
+    ports:
+      - "8090:8090"
+    environment:
+      API_TOKEN: ${API_TOKEN}
+      REFRESH_INTERVAL_H: "24"
+    volumes:
+      - ./data:/data
