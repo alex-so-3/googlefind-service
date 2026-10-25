@@ -25,7 +25,7 @@ GFMT = os.environ.get("GFMT_DIR", "/gfmt")
 os.chdir(GFMT)
 sys.path.insert(0, GFMT)
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query  # noqa: E402
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response  # noqa: E402
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer  # noqa: E402
 
 from Auth.fcm_receiver import FcmReceiver  # noqa: E402
@@ -41,7 +41,13 @@ from NovaApi.scopes import NOVA_ACTION_API_SCOPE  # noqa: E402
 from NovaApi.util import generate_random_uuid  # noqa: E402
 from ProtoDecoders import Common_pb2, DeviceUpdate_pb2  # noqa: E402
 from ProtoDecoders.decoder import parse_device_list_protobuf, parse_device_update_protobuf  # noqa: E402
-from SpotApi.UploadPrecomputedPublicKeyIds.upload_precomputed_public_key_ids import refresh_custom_trackers  # noqa: E402
+import httpx  # noqa: E402
+
+from Auth.spot_token_retrieval import get_spot_token  # noqa: E402
+from Auth.username_provider import get_username  # noqa: E402
+from SpotApi.CreateBleDevice.config import max_truncated_eid_seconds_server  # noqa: E402
+from SpotApi.grpc_parser import GrpcParser  # noqa: E402
+from SpotApi.UploadPrecomputedPublicKeyIds.upload_precomputed_public_key_ids import get_next_eids  # noqa: E402
 
 LOG = logging.getLogger("googlefind")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -49,6 +55,7 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime
 DB_FILE = os.environ.get("DB_FILE", "/data/reports.db")
 API_TOKEN = os.environ.get("API_TOKEN", "")
 REFRESH_INTERVAL_S = int(os.environ.get("REFRESH_INTERVAL_H", "24")) * 3600
+REFRESH_RETRY_S = 3600
 DEVICES_INTERVAL_S = 3600
 # EIDs handed out for ringing cover this much clock skew either side of now
 RING_EID_WINDOW_S = 6 * 3600
@@ -66,8 +73,8 @@ _db.commit()
 _devices = {}           # canonic id -> {"id", "name", "custom"}
 _devices_at = 0
 _pending = {}           # request uuid -> (device id, threading.Event)
-_state = {"started": int(time.time()), "fcm": False, "last_refresh": None, "last_locate": None,
-          "last_report": None, "last_error": None}
+_state = {"started": int(time.time()), "fcm": False, "last_refresh": None, "refresh_failing_since": None,
+          "last_locate": None, "last_report": None, "last_error": None}
 
 
 def error(msg):
@@ -183,40 +190,92 @@ def locate(device_id):
     return event
 
 
+def spot_call(scope, payload):
+    """GoogleFindMyTools' spot_request, except that a refusal raises. That one prints an HTTP
+    error and returns b'', which is also what an accepted upload returns."""
+    headers = {
+        "User-Agent": "com.google.android.gms/244433022 grpc-java-cronet/1.69.0-SNAPSHOT",
+        "Content-Type": "application/grpc",
+        "Te": "trailers",
+        "Authorization": "Bearer " + get_spot_token(get_username()),
+        "Grpc-Accept-Encoding": "gzip",
+    }
+    with httpx.Client(http2=True, timeout=30.0) as client:
+        response = client.post("https://spot-pa.googleapis.com/google.internal.spot.v1.SpotService/" + scope,
+                               headers=headers, content=GrpcParser.construct_grpc(payload))
+    grpc_status = response.headers.get("grpc-status", "0")
+    if response.status_code != 200 or grpc_status != "0":
+        raise RuntimeError(f"{scope}: HTTP {response.status_code}, grpc-status {grpc_status} "
+                           f"{response.headers.get('grpc-message', '')}".strip())
+    return GrpcParser.extract_grpc_payload(response.content)
+
+
+def upload_custom_eids(device_list):
+    """GoogleFindMyTools' refresh_custom_trackers without its catch-all, which printed a failure
+    and returned normally, so a refused upload was logged as a successful one. Returns how many
+    custom trackers were uploaded."""
+    request = DeviceUpdate_pb2.UploadPrecomputedPublicKeyIdsRequest()
+    for device in device_list.deviceMetadata:
+        registration = device.information.deviceRegistration
+        if not is_mcu_tracker(registration):
+            continue
+        ids = DeviceUpdate_pb2.UploadPrecomputedPublicKeyIdsRequest.DevicePublicKeyIds()
+        ids.pairDate = registration.pairDate
+        ids.canonicId.id = device.identifierInformation.canonicIds.canonicId[0].id
+        # From 3 hours ago, like GoogleFindMyTools, so a tracker whose clock lags is still matched
+        ids.clientList.publicKeyIdInfo.extend(get_next_eids(
+            retrieve_identity_key(registration), ids.pairDate, int(time.time()) - 3 * 3600,
+            duration_seconds=max_truncated_eid_seconds_server))
+        request.deviceEids.append(ids)
+    if request.deviceEids:
+        spot_call("UploadPrecomputedPublicKeyIds", request.SerializeToString())
+    return len(request.deviceEids)
+
+
 def refresh():
-    refresh_custom_trackers(load_devices(force=True))
+    try:
+        count = upload_custom_eids(load_devices(force=True))
+    except BaseException as e:
+        now = int(time.time())
+        _state["refresh_failing_since"] = _state["refresh_failing_since"] or now
+        error(f"custom tracker EID refresh failed: {e!r}")
+        raise
     _state["last_refresh"] = int(time.time())
-    LOG.info("custom tracker EIDs refreshed")
+    _state["refresh_failing_since"] = None
+    LOG.info("EIDs of %d custom tracker(s) re-uploaded", count)
 
 
-def refresh_worker():
-    while True:
-        try:
-            refresh()
-            delay = REFRESH_INTERVAL_S
-        except BaseException as e:
-            error(f"refresh failed: {e!r}")
-            delay = 3600
-        time.sleep(delay)
-
-
-def fcm_worker():
-    # Connect early so the first locate request does not wait for the FCM login
+def background_worker():
+    # FCM first, and early, so the first locate request does not wait for its login. The EID
+    # upload reads the FCM credentials too: started alongside, the first upload after every
+    # restart failed with "'FcmReceiver' object has no attribute 'credentials'".
     try:
         fcm_token()
     except BaseException as e:
         error(f"FCM start failed: {e!r}")
+    while True:
+        try:
+            refresh()
+            delay = REFRESH_INTERVAL_S
+        except BaseException:
+            # Google forgets the EIDs after about four days, so keep trying well before that
+            delay = REFRESH_RETRY_S
+        time.sleep(delay)
 
 
 @app.on_event("startup")
 def start():
-    threading.Thread(target=refresh_worker, daemon=True, name="refresh").start()
-    threading.Thread(target=fcm_worker, daemon=True, name="fcm").start()
+    threading.Thread(target=background_worker, daemon=True, name="background").start()
 
 
 @app.get("/health")
-def health():
-    return _state
+def health(response: Response):
+    """200 while the custom trackers' EIDs are being kept up, 503 once re-uploading them fails
+    (Google stops recognising such a tracker about four days after the last good upload)."""
+    ok = _state["refresh_failing_since"] is None
+    if not ok:
+        response.status_code = 503
+    return dict(_state, ok=ok)
 
 
 @app.get("/api/devices", dependencies=[Depends(check_token)])

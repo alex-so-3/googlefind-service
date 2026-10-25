@@ -16,7 +16,9 @@ after about four days, so the service re-uploads them daily.
 - Google is asked for fresh locations **only on request** (`POST .../locate`). The answer comes
   back asynchronously over Firebase Cloud Messaging; the service keeps that connection open.
 - Received reports are decrypted with the account's keys and stored in `data/reports.db`.
-- Once a day (`REFRESH_INTERVAL_H`) the EIDs of custom trackers are re-uploaded.
+- Once a day (`REFRESH_INTERVAL_H`) the EIDs of custom trackers are re-uploaded. If Google
+  refuses the upload, it is retried every hour and `/health` answers 503 until one succeeds:
+  Google stops recognising a custom tracker about four days after the last good upload.
 
 ## Setup
 
@@ -54,7 +56,7 @@ All `/api/*` calls need the token (`Authorization: Bearer <token>` or `X-Api-Tok
 
 | Method | Path | |
 |---|---|---|
-| GET | `/health` | status: FCM connected, last refresh, last locate, last error (no token) |
+| GET | `/health` | status: FCM connected, last refresh, `refresh_failing_since`, last locate, last error; 503 while the EID refresh is failing (no token) |
 | GET | `/api/devices` | devices: `id`, `name`, `custom`, `last_report` |
 | GET | `/api/devices/{id}/reports?since=<unix s>&limit=` | decrypted reports, newest first |
 | POST | `/api/devices/{id}/locate?wait=<s>` | ask Google now; with `wait` (≤ 60 s) block until the answer arrives |
